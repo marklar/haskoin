@@ -1,9 +1,10 @@
-{-# LANGUAGE NoImplicitPrelude, OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude #-}
 
 module Haskoin.Cli.Server where
 
-import Haskoin.Network
 import Protolude
+import Haskoin.Network
+
 
 main :: IO ()
 main = runSeedServer

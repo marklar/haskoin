@@ -19,6 +19,7 @@ library
                      , Haskoin.Mining
                      , Haskoin.Serialization
                      , Haskoin.Network
+                     , Haskoin.Util
                      , Haskoin.Cli.New
                      , Haskoin.Cli.Mine
                      , Haskoin.Cli.ListBalances

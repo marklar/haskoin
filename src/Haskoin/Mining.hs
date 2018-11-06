@@ -1,140 +1,179 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
-module Haskoin.Mining where
+module Haskoin.Mining
+  ( mineOn
+  , makeGenesis
+  , isValidChain
+  , isValidTxn
+  , addBlock
+  , accountBalances
+  ) where
 
-import Haskoin.Types
+import Protolude
+import Control.Comonad.Cofree ( Cofree((:<)) )
 
-import Control.Comonad.Cofree
-import Crypto.Hash
-import Crypto.Number.Serialize(os2ip)
-import Data.Binary
-import Haskoin.Serialization
-import Data.Time.Clock
-import Data.Time.Clock.POSIX
+import qualified Crypto.Hash as Crypto
+import           Crypto.Number.Serialize (os2ip)
+
+import qualified Data.Binary as Bin
+
+import qualified Data.Time.Clock as Clock
+import qualified Data.Time.Clock.POSIX as POSIX
+
 import qualified Data.Vector as V
 import qualified Data.Map as M
 
-import Protolude
+
+import Haskoin.Types
+-- needed for implicit importing of `instance Binary HaskoinHash`
+import Haskoin.Serialization
+import Haskoin.Util (average, safeDiv, timed)
+
+
 
 type TransactionPool = IO [Transaction]
 
+-- | Cfg
 globalTransactionLimit = 1000
 numBlocksToCalculateDifficulty = 5
 genesisBlockDifficulty = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 targetTime = 10
 blockReward = 1000
+difficultyFactor = 4
+
+
+
+printDifficulty :: Integer -> IO ()
+printDifficulty difficulty =
+  print ( "Candidate difficulty: ", logDifficulty difficulty )
+
+
+logDifficulty :: (Floating a) => Integer -> a
+logDifficulty difficulty = logBase 10 $ fromIntegral difficulty
+
 
 mineOn :: TransactionPool -> Account -> Blockchain -> IO Blockchain
-mineOn pendingTransactions minerAccount parent = do
-  ts <- pendingTransactions
-  ts <- return $ validTransactions parent ts
-  ts <- return $ take globalTransactionLimit ts
-  now <- getPOSIXTime
-  result <- loop now ts 0 (difficulty parent * 4)
-  after <- getPOSIXTime
-  print $ after - now
-  return result
+mineOn pendingTransactions minerAccount chain =
+  do
+    txns <- take globalTransactionLimit . filter (isValidTxn' $ accountBalances chain) <$> pendingTransactions
+    now  <- POSIX.getPOSIXTime
+    -- The `nonce` starts at 0, increments with each attempt.
+    timed $ do
+      print ("desiredDiff", logDifficulty desiredDiff)
+      let (ch, diffs) = loop now (Block $ V.fromList txns) 0 [nextDiff]
+      print ("candidate difficulties", logDifficulty <$> reverse diffs)
+      return ch
+      
   where
-    validChain bc = difficulty bc < desiredDifficulty parent
-    loop now ts nonce bestDifficulty = do
-      let header = BlockHeader {
-            _miner = minerAccount,
-            _parentHash = hashlazy $ encode parent,
-            _nonce = nonce,
-            _minedAt = now
-            }
-          block = Block (V.fromList ts)
-          candidate = addBlock block header parent
-          log = if candidateDifficulty < bestDifficulty
-                then do
-                  print ("New candidate found: ", logBase 10 $ fromIntegral $ desiredDifficulty parent, logBase 10 $ fromIntegral $ candidateDifficulty)
-                  return candidateDifficulty
-                else return bestDifficulty
-                where
-                  candidateDifficulty = difficulty candidate
-      if validChain candidate
-        then return candidate
-        else log >>= loop now ts (nonce+1)
+    desiredDiff = desiredDifficulty chain
+    nextDiff = getDifficulty chain * difficultyFactor
+    validChain bc = getDifficulty bc < desiredDiff
 
-difficulty :: Blockchain -> Integer
-difficulty bc = os2ip $ (hashlazy $ encode bc :: HaskoinHash)
+    loop :: POSIX.POSIXTime -> Block -> Integer -> [Integer] -> (Blockchain, [Integer])
+    loop time block nonce diffs@(bestDiff:_) =
+      if validChain chain'
+        then
+          (chain', newDiffs)
+        else
+          loop time block (nonce+1) newDiffs
+      where
+        chain' = addBlock block header chain
+        header = BlockHeader
+          { _miner = minerAccount
+          , _parentHash = Crypto.hashlazy $ Bin.encode chain
+          , _nonce = nonce  -- << Incremented with each attempt.
+          , _minedAt = time
+          }
+        newDiffs = if newDiff < bestDiff then newDiff:diffs else diffs
+        newDiff = getDifficulty chain'
+
+
+-- `accounts` is a map from an account (user id) to ???
+-- We want to see whether a particular txn (id) 
+isValidTxn' :: M.Map Account Integer -> Transaction -> Bool
+isValidTxn' accounts txn =
+  case M.lookup (_from txn) accounts of
+    Nothing ->
+      False
+    Just balance ->
+      balance >= _amount txn
+
+
+
+-- Perform hash on the entire blockchain (up to this point),
+-- then convert hash to an Integer.
+-- SHA1 produces a 20-byte message digest (often as 40-digit hex number).
+--
+-- os2ip :: ByteArrayAccess ba => ba -> Integer
+-- Converts a byte string (os) into a positive integer (ip).
+-- The lower the number, the greater the difficulty it adheres to.
+getDifficulty :: Blockchain -> Integer
+getDifficulty bc = os2ip (Crypto.hashlazy $ Bin.encode bc :: HaskoinHash)
+
 
 -- BEWARE: O(n * k), where k = numBlocksToCalculateDifficulty
 desiredDifficulty :: Blockchain -> Integer
 desiredDifficulty x = round $ loop x
   where
-    loop (_ :< Genesis) = genesisBlockDifficulty
+    loop   (_ :< Genesis)   = genesisBlockDifficulty
     loop x@(_ :< Node _ xs) = oldDifficulty / adjustmentFactor
       where
         oldDifficulty = loop xs
         adjustmentFactor = min 4.0 $ targetTime `safeDiv` blockTimeAverage x
 
-blockTimeAverage :: Blockchain -> NominalDiffTime
-blockTimeAverage bc = average $ zipWith (-) times (fromMaybe [] $ tailMay times)
+
+blockTimeAverage :: Blockchain -> Clock.NominalDiffTime
+blockTimeAverage bc =
+  average $ zipWith (-) times (fromMaybe [] $ tailMay times)
   where
     times = take numBlocksToCalculateDifficulty $ map _minedAt $ headers bc
 
 chains :: Blockchain -> [Blockchain]
-chains x@(_ :< Genesis) = [x]
+chains x@(_ :< Genesis)     = [x]
 chains x@(_ :< Node _ next) = x : chains next
 
 headers :: Blockchain -> [BlockHeader]
-headers (_ :< Genesis) = []
+headers (_ :< Genesis)     = []
 headers (_ :< Node x next) = x : headers next
 
-average :: (Foldable f, Num a, Fractional a, Eq a) => f a -> a
-average xs = sum xs `safeDiv` fromIntegral (length xs)
-
-safeDiv n d = n / (if d == 0 then 1 else d)
-                                                      
 makeGenesis :: IO Blockchain
 makeGenesis = return $ Block (V.fromList []) :< Genesis
 
-balances :: Blockchain -> M.Map Account Integer
-balances bc =
-  let txns = toList $ mconcat $ toList bc
-      debits = map (\Transaction{ _from = acc, _amount = amount} -> (acc, -amount)) txns
-      credits = map (\Transaction{ _to = acc, _amount = amount} -> (acc, amount)) txns
-      minings = map (\h -> (_miner h, blockReward)) $ headers bc
-  in M.fromListWith (+) $ debits ++ credits ++ minings
+-- Create a map: from user (account) to that user's balance.
+accountBalances :: Blockchain -> M.Map Account Integer
+accountBalances bc = M.fromListWith (+) $ debits ++ credits ++ minings
+  where
+    txns = toList $ mconcat $ toList bc
+    debits =  [ (_from x, negate $ _amount x) | x <- txns ]
+    credits = [ (_from x,          _amount x) | x <- txns ]
+    minings = [ (_miner h,       blockReward) | h <- headers bc ]
 
-validTransactions :: Blockchain -> [Transaction] -> [Transaction]
-validTransactions bc txns =
-  let accounts = balances bc
-      validTxn txn = case M.lookup (_from txn) accounts of
-        Nothing -> False
-        Just balance -> balance >= _amount txn
-  in filter validTxn txns
 
-validateChain :: Blockchain -> Bool
-validateChain _ = True
+-- | Logic?
+isValidChain :: Blockchain -> Bool
+isValidChain _ = True
 
-validateTxn :: Blockchain -> Transaction -> Bool
-validateTxn _ _ = True
+-- | Logic?
+isValidTxn :: Blockchain -> Transaction -> Bool
+isValidTxn _ _ = True
+
 
 addBlock :: Block -> BlockHeader -> Blockchain -> Blockchain
 addBlock block header chain = block :< Node header chain
 
 ----
 
-testMining :: IO Blockchain
-testMining = do
-  let txnPool = return []
-  chain <- makeGenesis
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  chain <- mineOn txnPool 0 chain
-  -- chain <- mineOn txnPool 0 chain
-  -- chain <- mineOn txnPool 0 chain
-  -- chain <- mineOn txnPool 0 chain
-  -- chain <- mineOn txnPool 0 chain
-  -- chain <- mineOn txnPool 0 chain
-  
-  return chain
+-- testMining :: IO Blockchain
+-- testMining = do
+--   let txnPool = return []
+--   chain <- makeGenesis
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   chain <- mineOn txnPool 0 chain
+--   mineOn txnPool 0 chain

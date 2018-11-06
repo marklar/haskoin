@@ -1,24 +1,34 @@
-{-# LANGUAGE NoImplicitPrelude, OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-module Haskoin.Cli.New where
-
-import Haskoin.Mining
-import Haskoin.Serialization
-import Haskoin.Types
+module Haskoin.Cli.New
+  ( main
+  ) where
 
 import Protolude
-import System.Environment
-import Data.Binary
+import Prelude (String)
+import qualified Data.Binary as Bin
 import qualified Data.ByteString.Lazy as BSL
 
+import qualified Haskoin.Mining as Mining
+
+
+-- | Cfg
 defaultChainFile = "main.chain"
+
 
 main :: IO ()
 main = do
+  filename <- getFilename
+  chain <- Mining.makeGenesis
+  BSL.writeFile filename $ Bin.encode chain
+  putStrLn $ "Wrote file: " ++ filename
+
+
+getFilename :: IO FilePath
+getFilename = do
   args <- getArgs
-  let filename = case args of
-        [] -> defaultChainFile
-        [x] -> x
-        _ -> panic "Usage: new [filename]"
-  chain <- makeGenesis
-  BSL.writeFile filename $ encode chain
+  return $ case args of
+    []  -> defaultChainFile
+    [x] -> x
+    _   -> panic "Usage: new [filename]"
